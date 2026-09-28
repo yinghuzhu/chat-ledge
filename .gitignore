@@ -1,0 +1,30 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+.secrets/
+key.txt
+key*.txt
+keys.json
+key*.json
+*-keys.json
+key-capture*/
+
+# Private WeChat data, plaintext exports, and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlcipher
+decrypted/
+exports/
+wechat-db-backup-*/
+backups/
+backup/
