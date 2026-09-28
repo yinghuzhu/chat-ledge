@@ -9,14 +9,16 @@
 - 周末复盘时快捷选择周一至周五。
 - 输出 JSONL 或 CSV 明细，以及 Markdown 统计摘要。
 - 统计消息量、活跃日期、消息类型、消息内可识别的发送者 username 和文本关键词。
+- 解压消息数据库中的 Zstandard 内容，恢复部分压缩文本，并提取分享卡片的标题、描述、链接和文件基本信息。
 
-发送者只从群消息自身携带的 username 前缀解析。没有可靠 username 的系统消息和媒体消息会留空，不会按通讯录好友关系推断群友身份。图片、语音、链接卡片等未解码内容不会作为普通文本分析。摘要里的关键词仅为词频线索，不是完整的语义结论。
+发送者只从群消息自身携带的 username 前缀解析；群 username 本身不会误认为个人发送者。昵称只在当前群成员名单中按 username 精确匹配联系人备注名/昵称，不会仅凭好友表推断群友身份。没有可靠映射的历史成员继续保留 username。图片和语音的媒体本体仍需单独处理；分享卡片的文字字段保存在明细 `metadata` 中。摘要里的关键词仅为词频线索，不是完整的语义结论。
 
 ## 环境要求
 
 - macOS 微信桌面版，数据位于默认沙盒目录：`~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/`
 - Python 3.9 或更新版本。
 - SQLCipher 4 动态库。Apple Silicon Homebrew 默认位置为 `/opt/homebrew/opt/sqlcipher/lib/libsqlcipher.dylib`；Intel Homebrew 常见位置为 `/usr/local/opt/sqlcipher/lib/libsqlcipher.dylib`。也可通过 `SQLCIPHER_LIBRARY` 指定动态库路径。
+- Zstandard 动态库（Homebrew 可运行 `brew install zstd`），用于解压压缩消息字段；缺少该库时普通未压缩文本仍可导出。
 - 本机私有 SQLCipher 密钥清单。默认使用 `~/wechat-export/key-capture/keys.json`；若该文件不存在且只找到一份旧式 `~/wechat-export/key-capture-*/keys.json`，工具会自动复用它。也可以用 `--key-file` 指定路径。密钥文件必须只允许当前用户读取（权限 `600`）。
 
 密钥获取脚本会把清单写到仓库以外的私有目录。请不要把密钥、清单、数据库副本或聊天记录复制进 Git 仓库或发给他人。项目不会打印密钥值。
@@ -135,7 +137,7 @@ python3 group_digest.py \
 - `<开始日期>_<结束日期>.jsonl` 或 `.csv`：范围内的逐条消息。
 - `<开始日期>_<结束日期>_summary.md`：总量、每日/月消息数、发送者统计和可读文本关键词。
 
-JSONL 每行是一条消息，字段包括群名、内部群 ID、时间、群消息内发送者 username、消息类型、正文、消息 ID 和来源分片。私有数据文件会设置为仅当前用户可读写（`600`）；目录为仅当前用户访问（`700`）。
+JSONL 每行是一条消息，字段包括群名、内部群 ID、时间、群消息内发送者 username、按该群当前成员名单精确匹配的 `sender_name`、消息类型、正文、分享卡片 `metadata`、消息 ID 和来源分片。未匹配到当前成员资料的历史发送者会保留 username，昵称不跨群或按好友关系猜测。私有数据文件会设置为仅当前用户可读写（`600`）；目录为仅当前用户访问（`700`）。
 
 ## 脚本说明
 
@@ -151,7 +153,7 @@ JSONL 每行是一条消息，字段包括群名、内部群 ID、时间、群�
 
 主命令行工具。只读当前微信 SQLCipher 数据库，并读取相邻 WAL 文件中已提交的记录。它从联系人库取得群名和内部群 ID，再按 `Msg_<MD5(群 ID)>` 匹配分布在多个 `message_*.db` 中的消息表，按时间合并分片并导出。
 
-消息正文中的群 username 用作发送者标识；本地联系人昵称不会覆盖它。无法可靠解码的系统或富媒体负载会替换为占位说明。关键词摘要只处理可读普通文本。
+消息正文中的群 username 用作发送者标识；本地联系人昵称不会覆盖它。程序用 SQLite `hex()` 保留二进制字段原始字节，再按需解压 Zstandard。分享卡片的标题、描述、链接、文件扩展名和大小（若存在）放在每条记录的 `metadata` 对象中；JSONL 中是对象，CSV 中是 JSON 字符串。图片、语音等媒体文件本体仍未提取。关键词摘要只处理可读普通文本。
 
 ### `sqlcipher_probe.py`
 

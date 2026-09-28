@@ -8,12 +8,15 @@
 import argparse
 import collections
 import csv
+import ctypes as C
+import ctypes.util
 import datetime as dt
 import hashlib
 import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,6 +27,10 @@ TZ = ZoneInfo("Asia/Shanghai")
 MSG_HASH = re.compile(r"^Msg_([0-9a-fA-F]{32})$")
 SENDER_BODY = re.compile(r"^([^:\r\n]{1,128}):\r?\n(.*)$", re.S)
 BAD_TEXT = re.compile("\ufffd")
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+_ZSTD = None
+_ZSTD_CHECKED = False
 
 
 def parser():
@@ -84,6 +91,32 @@ def query_contacts(db_class, load_key, key_file, account):
                 title = "未命名群"
             result[uid] = title
         return result
+    finally:
+        db.close()
+
+
+def query_group_member_names(db_class, load_key, key_file, account, chat_id):
+    """Map usernames to local names only through this room's explicit member list."""
+    db = open_db(db_class, load_key, key_file, account / "db_storage/contact/contact.db")
+    try:
+        tables = {r["name"] for r in db.query("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"chat_room", "chatroom_member", "contact"}.issubset(tables):
+            return {}
+        escaped_id = chat_id.replace("'", "''")
+        rows = db.query(
+            "SELECT c.username, c.nick_name, c.remark "
+            "FROM chat_room cr "
+            "JOIN chatroom_member cm ON cm.room_id=cr.id "
+            "JOIN contact c ON c.id=cm.member_id "
+            f"WHERE cr.username='{escaped_id}'"
+        )
+        names = {}
+        for row in rows:
+            username = (row.get("username") or "").strip()
+            display_name = (row.get("remark") or "").strip() or (row.get("nick_name") or "").strip()
+            if username and display_name:
+                names[username] = display_name
+        return names
     finally:
         db.close()
 
@@ -163,17 +196,110 @@ def safe_text(value):
     return "".join(ch for ch in value if ch in "\n\r\t" or ord(ch) >= 32)
 
 
-def decode_content(raw, typ):
-    text = safe_text(raw)
-    if text.startswith("[系统/富媒体负载未解码]"):
-        return None, text
+def zstd_library():
+    global _ZSTD, _ZSTD_CHECKED
+    if _ZSTD_CHECKED:
+        return _ZSTD
+    _ZSTD_CHECKED = True
+    name = ctypes.util.find_library("zstd")
+    if not name:
+        return None
+    try:
+        lib = C.CDLL(name)
+        lib.ZSTD_getFrameContentSize.argtypes = [C.c_void_p, C.c_size_t]
+        lib.ZSTD_getFrameContentSize.restype = C.c_ulonglong
+        lib.ZSTD_decompress.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t]
+        lib.ZSTD_decompress.restype = C.c_size_t
+        lib.ZSTD_isError.argtypes = [C.c_size_t]
+        lib.ZSTD_isError.restype = C.c_uint
+        _ZSTD = lib
+    except (AttributeError, OSError):
+        _ZSTD = None
+    return _ZSTD
+
+
+def decode_payload(raw_hex):
+    """Decode SQLite hex() output without truncating binary content at NUL."""
+    if not raw_hex:
+        return ""
+    try:
+        payload = bytes.fromhex(raw_hex)
+    except ValueError:
+        return "[系统/富媒体负载未解码]"
+    if payload.startswith(ZSTD_MAGIC):
+        lib = zstd_library()
+        if not lib:
+            return "[Zstandard 内容未解压：未找到 libzstd]"
+        source = C.create_string_buffer(payload)
+        size = lib.ZSTD_getFrameContentSize(source, len(payload))
+        # ZSTD_CONTENTSIZE_UNKNOWN and ZSTD_CONTENTSIZE_ERROR are near UINT64_MAX.
+        if size >= (1 << 64) - 2 or size > MAX_DECOMPRESSED_BYTES:
+            return "[Zstandard 内容未解压：长度未知或超过上限]"
+        target = C.create_string_buffer(size)
+        result = lib.ZSTD_decompress(target, size, source, len(payload))
+        if lib.ZSTD_isError(result):
+            return "[Zstandard 内容未解压：数据校验失败]"
+        payload = target.raw[:result]
+    return payload.decode("utf-8", "replace")
+
+
+def xml_metadata(text):
+    """Extract descriptive app-message fields, excluding media keys/tokens."""
+    start = re.search(r"<msg(?:\s|>)", text)
+    if not start:
+        return {}
+    end = text.find("</msg>", start.start())
+    if end < 0:
+        return {}
+    try:
+        root = ET.fromstring(text[start.start():end + len("</msg>")])
+    except ET.ParseError:
+        return {}
+    appmsg = root.find(".//appmsg")
+    if appmsg is None:
+        return {}
+    values = {}
+    fields = {"title": "title", "description": "des", "url": "url",
+              "app_name": "appname", "app_type": "type"}
+    for output, tag in fields.items():
+        value = appmsg.findtext(tag)
+        if value and value.strip():
+            values[output] = value.strip()
+    attachment = appmsg.find("appattach")
+    if attachment is not None:
+        file_size = attachment.findtext("totallen")
+        file_ext = attachment.findtext("fileext")
+        if file_size and file_size.isdigit():
+            values["file_size_bytes"] = int(file_size)
+        if file_ext and file_ext.strip():
+            values["file_extension"] = file_ext.strip()
+    return values
+
+
+def decode_content(raw_hex, typ):
+    text = decode_payload(raw_hex)
+    if text.startswith(("[系统/富媒体负载未解码]", "[Zstandard 内容未解压")):
+        return None, text, {}
     match = SENDER_BODY.match(text)
     if match:
-        return match.group(1).strip(), match.group(2)
-    return None, text
+        sender, text = match.group(1).strip(), match.group(2)
+    else:
+        sender = None
+    metadata = xml_metadata(text) if (int(typ or 0) & 255) == 49 else {}
+    if metadata:
+        parts = ["[分享]"]
+        if metadata.get("title"):
+            parts.append(metadata["title"])
+        if metadata.get("description"):
+            parts.append(metadata["description"])
+        if metadata.get("url"):
+            parts.append(metadata["url"])
+        text = "\n".join(parts)
+    return sender, safe_text(text), metadata
 
 
-def fetch_chat(db_class, load_key, key_file, matches, start_ts, end_ts, limit):
+def fetch_chat(db_class, load_key, key_file, matches, start_ts, end_ts, limit, member_names=None):
+    member_names = member_names or {}
     rows = []
     def append_rows(batch, title, uid, shard):
         for raw in batch:
@@ -181,10 +307,14 @@ def fetch_chat(db_class, load_key, key_file, matches, start_ts, end_ts, limit):
             if ts > 10_000_000_000:
                 ts //= 1000
             typ = raw.get(type_col, "") if type_col else ""
-            content = safe_text(raw.get(content_col)) if content_col else ""
-            sender, content = decode_content(content, typ)
+            sender, content, metadata = decode_content(raw.get("__content_hex"), typ)
+            # Some rows carry the room username as a prefix; it is not a person.
+            if sender == uid or (sender and sender.endswith("@chatroom")):
+                sender = None
             rows.append({"chat": title, "chat_id": uid, "time": dt.datetime.fromtimestamp(ts, TZ).isoformat(sep=" ", timespec="seconds"),
-                         "timestamp": ts, "sender": sender, "type": str(typ), "content": content,
+                         "timestamp": ts, "sender": sender, "sender_name": member_names.get(sender, ""),
+                         "type": str(typ), "content": content,
+                         "metadata": metadata,
                          "local_id": raw.get(id_col) if id_col else None,
                          "server_id": raw.get(server_id_col) if server_id_col else None,
                          "source_shard": shard})
@@ -201,9 +331,12 @@ def fetch_chat(db_class, load_key, key_file, matches, start_ts, end_ts, limit):
             sender_id_col = "real_sender_id" if "real_sender_id" in cols else None
             if not time_col:
                 raise RuntimeError(f"{path.name}:{table} 没有识别时间列")
-            selected = list(dict.fromkeys(c for c in [id_col, server_id_col, time_col, type_col, sender_id_col, content_col] if c))
+            selected = list(dict.fromkeys(c for c in [id_col, server_id_col, time_col, type_col, sender_id_col] if c))
+            select_sql = [f'"{column}"' for column in selected]
+            if content_col:
+                select_sql.append(f'hex("{content_col}") AS "__content_hex"')
             # Stream rows in bounded batches; weekly reports can span hundreds of thousands of events.
-            sql = f'SELECT {", ".join(chr(34)+c+chr(34) for c in selected)} FROM "{table}" WHERE "{time_col}" >= {start_ts} AND "{time_col}" < {end_ts} ORDER BY "{time_col}"'
+            sql = f'SELECT {", ".join(select_sql)} FROM "{table}" WHERE "{time_col}" >= {start_ts} AND "{time_col}" < {end_ts} ORDER BY "{time_col}"'
             batch_size = 2000
             offset = 0
             while True:
@@ -230,19 +363,27 @@ def fetch_chat(db_class, load_key, key_file, matches, start_ts, end_ts, limit):
 def summarize(rows, title, start, end):
     types = collections.Counter(r["type"] for r in rows)
     senders = collections.Counter(r["sender"] for r in rows if r["sender"])
+    named_senders = collections.Counter((r.get("sender_name") or "", r["sender"])
+                                        for r in rows if r["sender"])
+    named_messages = sum(count for (name, _username), count in named_senders.items() if name)
+    named_usernames = sum(1 for name, _username in named_senders if name)
     daily = collections.Counter(r["time"][:10] for r in rows)
     monthly = collections.Counter(r["time"][:7] for r in rows)
     plain_count = sum(1 for r in rows if r["type"] == "1")
     lines = [f"# {title}：{start} 至 {end} 消息统计", "", f"- 消息总数：{len(rows):,}",
-             f"- 普通文本消息（type=1）：{plain_count:,}", f"- 可解析群成员发送者：{sum(1 for r in rows if r['sender']):,} 条，{len(senders):,} 个 username",
+             f"- 普通文本消息（type=1）：{plain_count:,}",
+             f"- 已提取分享卡片元数据：{sum(1 for r in rows if r['metadata']):,} 条",
+             f"- 可解析发送者 username：{sum(1 for r in rows if r['sender']):,} 条，{len(senders):,} 个 username",
+             f"- 匹配到本地昵称：{named_messages:,} 条，{named_usernames:,} 个 username",
              f"- 无法确认发送者：{sum(1 for r in rows if not r['sender']):,} 条",
              f"- 活跃日期：{len(daily):,} 天", f"- 消息类型数：{len(types):,}", "",
              "## 每日消息量", "", "| 日期 | 条数 |", "|---|---:|"]
     lines += [f"| {day} | {count:,} |" for day, count in sorted(daily.items())]
     lines += ["", "## 每月消息量", "", "| 月份 | 条数 |", "|---|---:|"]
     lines += [f"| {month} | {count:,} |" for month, count in sorted(monthly.items())]
-    lines += ["", "## 活跃发送者（消息内 username）", "", "| Username | 条数 |", "|---|---:|"]
-    lines += [f"| `{name}` | {count:,} |" for name, count in senders.most_common(30)]
+    lines += ["", "## 活跃发送者", "", "| 本地昵称 | 群消息 username | 条数 |", "|---|---|---:|"]
+    lines += [f"| {name or '（未匹配昵称）'} | `{username}` | {count:,} |"
+              for (name, username), count in named_senders.most_common(30)]
     lines += ["", "## 内容简析", "", "以下仅对可读纯文本做启发式关键词统计，不代表语义分类；建议阅读导出文本后再归纳主题。", ""]
     words = collections.Counter()
     stop = set("我们 你们 他们 这个 那个 可以 不是 没有 一个 真的 感觉 现在 今天 时候 因为 所以 怎么 什么 如果 还是 但是 而且 大家 一下 这里 那里".split())
@@ -253,7 +394,7 @@ def summarize(rows, title, start, end):
             if word not in stop and len(word) < 25:
                 words[word.lower()] += 1
     lines += ["关键词（原文词频，不等同主题结论）：" + ("、".join(f"{w}（{n}）" for w, n in words.most_common(30)) or "无可统计纯文本"), "",
-              "> 发送者只从群消息内容的 username 前缀提取。没有此前缀时留空；不会依据本地好友/联系人昵称推断。图片、语音、链接卡片等未解码内容不进入文本关键词统计。"]
+              "> 发送者从群消息内容的 username 前缀提取；昵称只在该群 chatroom_member 名单中按 username 精确匹配本地联系人资料，优先使用备注名，其次使用昵称。未匹配到的历史成员只保留 username，不按好友列表猜测。关键词仅统计可读普通文本；分享卡片信息保存在 metadata 字段。"]
     return "\n".join(lines) + "\n"
 
 
@@ -265,9 +406,9 @@ def write_rows(rows, path, fmt):
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
     else:
         with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["chat", "chat_id", "time", "timestamp", "sender", "type", "content", "local_id", "source_shard"])
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["chat", "chat_id", "time", "timestamp", "sender", "sender_name", "type", "content", "metadata", "local_id", "source_shard"])
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows({**row, "metadata": json.dumps(row["metadata"], ensure_ascii=False)} for row in rows)
     os.chmod(path, 0o600)
 
 
@@ -316,7 +457,8 @@ def main():
             return 2
         group = next(iter(groups.values()))
         start_ts, end_ts = date_bounds(start, end)
-        rows = fetch_chat(db_class, load_key, key_file, group["matches"], start_ts, end_ts, args.limit)
+        member_names = query_group_member_names(db_class, load_key, key_file, account, group["matches"][0][0])
+        rows = fetch_chat(db_class, load_key, key_file, group["matches"], start_ts, end_ts, args.limit, member_names)
         folder_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", group["title"]).strip(" .") or "未命名群"
         same_title_count = sum(1 for title in contacts.values() if title == group["title"])
         if same_title_count > 1:
