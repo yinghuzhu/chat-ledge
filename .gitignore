@@ -10,6 +10,7 @@ venv/
 .env.*
 !.env.example
 .secrets/
+.wechat-local/
 key.txt
 key*.txt
 keys.json

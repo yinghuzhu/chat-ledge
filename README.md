@@ -17,9 +17,67 @@
 - macOS 微信桌面版，数据位于默认沙盒目录：`~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/`
 - Python 3.9 或更新版本。
 - SQLCipher 4 动态库。Apple Silicon Homebrew 默认位置为 `/opt/homebrew/opt/sqlcipher/lib/libsqlcipher.dylib`；Intel Homebrew 常见位置为 `/usr/local/opt/sqlcipher/lib/libsqlcipher.dylib`。也可通过 `SQLCIPHER_LIBRARY` 指定动态库路径。
-- 本机私有 SQLCipher 密钥清单。默认查找 `~/wechat-export/key-capture-20260928/keys.json`，也可以用 `--key-file` 指定其他路径。密钥文件必须只允许当前用户读取（权限 `600`）。
+- 本机私有 SQLCipher 密钥清单。默认使用 `~/wechat-export/key-capture/keys.json`；若该文件不存在且只找到一份旧式 `~/wechat-export/key-capture-*/keys.json`，工具会自动复用它。也可以用 `--key-file` 指定路径。密钥文件必须只允许当前用户读取（权限 `600`）。
 
-密钥清单由本机一次性密钥获取流程产生，不属于本项目文件。请不要把密钥、清单、数据库副本或聊天记录复制进仓库、提交到 Git 或发给他人。项目不会打印密钥值。
+密钥获取脚本会把清单写到仓库以外的私有目录。请不要把密钥、清单、数据库副本或聊天记录复制进 Git 仓库或发给他人。项目不会打印密钥值。
+
+## 首次获取密钥
+
+已有密钥时先复用并验证，不要每次使用都重新获取。没有可用密钥时，按下面流程为本人账号初始化一次。
+
+### 1. 备份并选定账号数据库
+
+```bash
+./0_backup.sh
+find "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files" \
+  -maxdepth 3 -type d -name db_storage -print
+```
+
+从输出中确认本人账号的 `db_storage` 路径，并在终端设置变量：
+
+```bash
+WX_DB="$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/本人账号目录/db_storage"
+KEYS="$HOME/wechat-export/key-capture/keys.json"
+```
+
+多账号时必须手动选对 `WX_DB`。不要混用其他账号或其他数据库副本的密钥。
+若已有密钥保存在旧式带日期目录（例如 `~/wechat-export/key-capture-20260928/keys.json`），把上面的 `KEYS` 改成那份文件的完整路径。
+
+### 2. 检查现有密钥
+
+如果手上已有密钥，先针对该账号的消息库做只读验证：
+
+```bash
+python3 sqlcipher_probe.py verify \
+  --db "$WX_DB/message/message_0.db" \
+  --key-file "$KEYS"
+```
+
+看到 `verified: true` 后再运行 `python3 group_digest.py --list` 检查联系人库和消息分片是否可读。如果密钥有效，就跳过下一步。新建的消息分片可能尚未包含在旧密钥清单中；若工具报告该分片缺少密钥，应核对账号和数据库路径，再考虑重新获取。
+
+### 3. 没有有效密钥时运行获取脚本
+
+密钥获取需要 Apple Silicon（arm64）Mac、可用的 Xcode Command Line Tools/LLDB，以及本人能登录的微信账号。先保存工作并从微信菜单**正常退出微信**。脚本会拒绝以 `sudo` 运行，也会拒绝在原版微信仍运行时启动。
+
+```bash
+python3 bootstrap_keys.py \
+  --db-root "$WX_DB" \
+  --state-dir "$HOME/wechat-export/key-capture" \
+  --acknowledge-debug-copy
+```
+
+脚本会复制微信到私有状态目录，只对临时副本做 ad-hoc 签名，再由 LLDB 启动这个副本并观察数据库密钥派生调用。你需要在临时微信窗口里登录本人账号，必要时用手机确认或扫码；不要在临时副本里继续聊天。捕获到的候选密钥会按数据库盐值逐库验证，通过 HMAC 检查后才以 `0600` 权限写入 `keys.json`。流程结束会关闭临时进程、禁用副本并请求恢复原版微信；请亲自确认原版可以正常打开和登录。
+
+成功后验证刚写入的清单并列出群：
+
+```bash
+python3 sqlcipher_probe.py verify --db "$WX_DB/message/message_0.db" --key-file "$KEYS"
+python3 group_digest.py --key-file "$KEYS" --list
+```
+
+`bootstrap_keys.py` 默认拒绝覆盖已有密钥、临时副本或禁用副本。如果上一次中断留下状态，不要直接删除；先确认临时微信已退出，再检查状态目录。确实需要重做时，为 `--state-dir` 选择一个新的私有目录，并随后用对应的 `--key-file`。
+
+**兼容性边界：**捕获核心只支持 Apple Silicon 上通过 LLDB 启动的微信进程。它依赖具体微信版本中的 PBKDF 调用；本机当前安装报告为微信 4.1.11，而这套封装的公开实测说明覆盖微信 4.1.15。因此 4.1.11 的首次重新捕获没有在本仓库中单独验收，若该版本没有触发断点，脚本会超时/失败，不应把失败解释为数据损坏。已经验证可用的密钥应继续复用。副本需要使用真实账号数据，可能触发登录验证；此操作会中断微信并改变临时副本签名状态，不能保证腾讯对登录行为无感知。不要关闭 SIP、不要使用 `sudo`，也不要把密钥发给他人。
 
 ## 快速开始
 
@@ -81,6 +139,14 @@ JSONL 每行是一条消息，字段包括群名、内部群 ID、时间、群�
 
 ## 脚本说明
 
+### `bootstrap_keys.py`
+
+首次取钥的流程编排器。检查平台、架构、权限、微信进程和状态目录；复制指定微信 App，仅对副本 ad-hoc 签名；调用捕获脚本，并在结束时关闭/禁用副本、检查原版签名未变化，再请求恢复原版。不要跳过 README 的前置说明，不要使用 `sudo`。
+
+### `capture_keys.py`
+
+由 `bootstrap_keys.py` 调用的 LLDB 捕获核心。只启动指定的微信副本，不 attach 任意进程；在 Apple Silicon 上观察 PBKDF 参数，只处理与所选数据库盐值匹配的候选，并在输出密钥前验证数据库页 HMAC。密钥只写私有 JSON 文件，不打印到终端。版本兼容边界和捕获失败时的含义见“首次获取密钥”。
+
 ### `group_digest.py`
 
 主命令行工具。只读当前微信 SQLCipher 数据库，并读取相邻 WAL 文件中已提交的记录。它从联系人库取得群名和内部群 ID，再按 `Msg_<MD5(群 ID)>` 匹配分布在多个 `message_*.db` 中的消息表，按时间合并分片并导出。
@@ -99,6 +165,8 @@ JSONL 每行是一条消息，字段包括群名、内部群 ID、时间、群�
 ./0_backup.sh
 ./0_backup.sh --full --dest /Volumes/Backup/wechat
 ```
+
+`bootstrap_keys.py` 与 `capture_keys.py` 来源于 [wechat-key-research](https://gist.github.com/0a01249ef72970d07a2603dbb629e80f)，按随附 MIT 许可保留版权和许可声明。
 
 ## 隐私与 Git
 

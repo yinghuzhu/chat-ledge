@@ -127,8 +127,9 @@ if [[ $ok -eq 1 ]]; then
   echo "[✓] 备份完成且校验一致：$DEST"
   echo
   echo "下一步："
-  echo "  运行群聊统计： python3 group_digest.py --list"
-  echo "  密钥清单应由你本机单独保管，并通过 --key-file 指定；不要放入备份或 Git 仓库。"
+  echo "  1. 如果还没有有效密钥，先阅读 README.md 的‘首次获取密钥’并运行 bootstrap_keys.py。"
+  echo "  2. 验证密钥后运行： python3 group_digest.py --list"
+  echo "  密钥清单保存在仓库之外的私有目录，不要放入备份或 Git 仓库。"
 else
   echo "[x] 校验未通过，请检查磁盘空间后重跑。"
   exit 1

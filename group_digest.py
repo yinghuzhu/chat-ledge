@@ -18,7 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 DEFAULT_CONTAINER = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
-DEFAULT_KEY_FILE = Path.home() / "wechat-export/key-capture-20260928/keys.json"
+DEFAULT_KEY_FILE = Path.home() / "wechat-export/key-capture/keys.json"
 DEFAULT_OUT = Path.home() / "wechat-export/exports"
 TZ = ZoneInfo("Asia/Shanghai")
 MSG_HASH = re.compile(r"^Msg_([0-9a-fA-F]{32})$")
@@ -36,7 +36,7 @@ def parser():
     p.add_argument("--list", action="store_true", help="列出可识别群组")
     p.add_argument("--account", help="微信账号目录名，默认自动选择数据最大的账号")
     p.add_argument("--container", default=str(DEFAULT_CONTAINER), help="微信 xwechat_files 路径")
-    p.add_argument("--key-file", default=str(DEFAULT_KEY_FILE), help="私有 JSON 密钥清单路径")
+    p.add_argument("--key-file", default=None, help="私有 JSON 密钥清单路径")
     p.add_argument("--outdir", default=str(DEFAULT_OUT), help="导出根目录")
     p.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
     p.add_argument("--limit", type=int, default=0, help="仅取前 N 条，默认全部")
@@ -278,7 +278,13 @@ def main():
         container = Path(args.container).expanduser()
         account = choose_account(container, args.account)
         db_class, load_key = get_crypto_db_class()
-        key_file = Path(args.key_file).expanduser()
+        key_file = Path(args.key_file).expanduser() if args.key_file else DEFAULT_KEY_FILE
+        if not args.key_file and not key_file.exists():
+            legacy = sorted((Path.home() / "wechat-export").glob("key-capture-*/keys.json"))
+            if len(legacy) == 1:
+                key_file = legacy[0]
+            elif len(legacy) > 1:
+                raise ValueError("发现多份历史密钥清单，请用 --key-file 明确指定正确文件")
         contacts = query_contacts(db_class, load_key, key_file, account)
         tables = find_group_tables(db_class, load_key, key_file, account, contacts)
         if args.list:
