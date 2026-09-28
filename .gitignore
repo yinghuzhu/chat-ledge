@@ -26,6 +26,10 @@ key-capture*/
 *.sqlcipher
 decrypted/
 exports/
+*.jsonl
+*.jsonl.gz
+*.csv
+*_summary.md
 wechat-db-backup-*/
 backups/
 backup/

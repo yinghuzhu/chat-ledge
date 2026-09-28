@@ -41,7 +41,7 @@ KEYS="$HOME/wechat-export/key-capture/keys.json"
 ```
 
 多账号时必须手动选对 `WX_DB`。不要混用其他账号或其他数据库副本的密钥。
-若已有密钥保存在旧式带日期目录（例如 `~/wechat-export/key-capture-20260928/keys.json`），把上面的 `KEYS` 改成那份文件的完整路径。
+若已有密钥保存在旧式带日期目录（例如 `~/wechat-export/key-capture-<日期>/keys.json`），把上面的 `KEYS` 改成那份文件的完整路径。
 
 ### 2. 检查现有密钥
 
@@ -77,7 +77,7 @@ python3 group_digest.py --key-file "$KEYS" --list
 
 `bootstrap_keys.py` 默认拒绝覆盖已有密钥、临时副本或禁用副本。如果上一次中断留下状态，不要直接删除；先确认临时微信已退出，再检查状态目录。确实需要重做时，为 `--state-dir` 选择一个新的私有目录，并随后用对应的 `--key-file`。
 
-**兼容性边界：**捕获核心只支持 Apple Silicon 上通过 LLDB 启动的微信进程。它依赖具体微信版本中的 PBKDF 调用；本机当前安装报告为微信 4.1.11，而这套封装的公开实测说明覆盖微信 4.1.15。因此 4.1.11 的首次重新捕获没有在本仓库中单独验收，若该版本没有触发断点，脚本会超时/失败，不应把失败解释为数据损坏。已经验证可用的密钥应继续复用。副本需要使用真实账号数据，可能触发登录验证；此操作会中断微信并改变临时副本签名状态，不能保证腾讯对登录行为无感知。不要关闭 SIP、不要使用 `sudo`，也不要把密钥发给他人。
+**兼容性边界：**捕获核心只支持 Apple Silicon 上通过 LLDB 启动的微信进程。它依赖具体微信版本中的 PBKDF 调用；随附方法的公开实测说明覆盖微信 4.1.15，其他版本需单独验证。若目标版本没有触发断点，脚本会超时/失败，不应把失败解释为数据损坏。已经验证可用的密钥应继续复用。副本需要使用真实账号数据，可能触发登录验证；此操作会中断微信并改变临时副本签名状态，不能保证服务端对登录行为无感知。不要关闭 SIP、不要使用 `sudo`，也不要把密钥发给他人。
 
 ## 快速开始
 
@@ -88,28 +88,28 @@ python3 group_digest.py --key-file "$KEYS" --list
 python3 group_digest.py --list
 
 # 查看指定日期范围内有消息的群及消息数
-python3 group_digest.py --start 2026-09-21 --end 2026-09-27 --list
+python3 group_digest.py --start 2025-01-06 --end 2025-01-10 --list
 
 # 导出指定群在一个日期范围内的消息，并生成统计摘要
 python3 group_digest.py \
-  --chat "Caoz 的核心读者" \
-  --start 2022-03-12 \
-  --end 2022-03-18
+  --chat "示例交流群" \
+  --start 2025-01-06 \
+  --end 2025-01-10
 
 # 周末复盘最近结束的一周（周一至周五）
-python3 group_digest.py --chat "Caoz 的核心读者" --weekdays
+python3 group_digest.py --chat "示例交流群" --weekdays
 
 # 指定某周中的任意日期，统计该周周一至周五
 python3 group_digest.py \
-  --chat "Caoz 的核心读者" \
+  --chat "示例交流群" \
   --weekdays \
-  --week-of 2026-09-28
+  --week-of 2025-01-08
 
 # 输出 CSV 明细
 python3 group_digest.py \
-  --chat "Caoz 的核心读者" \
-  --start 2026-09-21 \
-  --end 2026-09-27 \
+  --chat "示例交流群" \
+  --start 2025-01-06 \
+  --end 2025-01-10 \
   --format csv
 ```
 
