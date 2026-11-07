@@ -33,3 +33,14 @@ exports/
 wechat-db-backup-*/
 backups/
 backup/
+
+# Weekly digest data and generated cards (contain real chat content).
+# Keep them in the external data dir ~/wechat-export/, never in this repo.
+weekly_data*.json
+week_*.html
+week_*.png
+weekly_*.html
+weekly_*.png
+
+# Local agent working notes
+.workbuddy/
